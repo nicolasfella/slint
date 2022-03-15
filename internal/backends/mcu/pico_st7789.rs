@@ -4,13 +4,17 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec;
+use cortex_m::singleton;
 pub use cortex_m_rt::entry;
-use embedded_hal::blocking::spi::Transfer;
+use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::prelude::*;
+use embedded_hal::blocking::spi::{Transfer, Write};
 use embedded_hal::digital::v2::{InputPin, OutputPin};
 use embedded_time::rate::*;
-use rp_pico::hal::pac;
-use rp_pico::hal::prelude::*;
-use rp_pico::hal::{self, Timer};
+use hal::dma::{DMAExt, SingleChannel, WriteTarget};
+use hal::pio::ValidStateMachine;
+use rp_pico::hal::{self, pac, prelude::*, Timer};
 
 use defmt_rtt as _; // global logger
 
@@ -24,6 +28,7 @@ fn oom(layout: core::alloc::Layout) -> ! {
 use alloc_cortex_m::CortexMHeap;
 
 use crate::{Devices, PhysicalRect, PhysicalSize};
+use i_slint_core::lengths::PhysicalLength;
 
 const HEAP_SIZE: usize = 200 * 1024;
 static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
@@ -65,23 +70,27 @@ pub fn init() {
     let _spi_miso = pins.gpio12.into_mode::<hal::gpio::FunctionSpi>();
 
     let spi = hal::spi::Spi::<_, _, 8>::new(pac.SPI1);
-
     let spi = spi.init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
         SPI_ST7789VW_MAX_FREQ,
         &embedded_hal::spi::MODE_3,
     );
-    // FIXME: a cleaner way to get a static reference, or be able to use non-static backend
-    let spi = Box::leak(Box::new(shared_bus::BusManagerSimple::new(spi)));
+    let spi = singleton!(:shared_bus::BusManagerSimple<hal::Spi<hal::spi::Enabled,  pac::SPI1, 8>> = shared_bus::BusManagerSimple::new(spi)).unwrap();
 
     let rst = pins.gpio15.into_push_pull_output();
 
     let dc = pins.gpio8.into_push_pull_output();
     let cs = pins.gpio9.into_push_pull_output();
+
+    let (dc_copy, cs_copy) =
+        unsafe { (core::ptr::read(&dc as *const _), core::ptr::read(&cs as *const _)) };
+
     let di = display_interface_spi::SPIInterface::new(spi.acquire_spi(), dc, cs);
 
-    let mut display = st7789::ST7789::new(di, rst, 320, 240);
+    const DISPLAY_SIZE: PhysicalSize = PhysicalSize::new(320, 240);
+    let mut display =
+        st7789::ST7789::new(di, rst, DISPLAY_SIZE.width as _, DISPLAY_SIZE.height as _);
 
     // Turn on backlight
     {
@@ -103,29 +112,144 @@ pub fn init() {
 
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
 
-    crate::init_with_display(PicoDevices { display, touch, last_touch: Default::default(), timer });
+    let dma = pac.DMA.split(&mut pac.RESETS);
+    // SAFETY: This is not safe :-(
+    let stolen_spi = unsafe {
+        hal::spi::Spi::<_, _, 8>::new(rp_pico::hal::pac::Peripherals::steal().SPI1).init(
+            &mut pac.RESETS,
+            clocks.peripheral_clock.freq(),
+            SPI_ST7789VW_MAX_FREQ,
+            &embedded_hal::spi::MODE_3,
+        )
+    };
+    let pio = PioTransfer::Idle(
+        dma.ch0,
+        vec![Rgb565::default(); DISPLAY_SIZE.width as _].leak(),
+        stolen_spi,
+    );
+
+    crate::init_with_display(PicoDevices {
+        display,
+        touch,
+        last_touch: Default::default(),
+        timer,
+        buffer: vec![Rgb565::default(); DISPLAY_SIZE.width as _].leak(),
+        pio: Some(pio),
+        stolen_pin: (dc_copy, cs_copy),
+    });
 }
 
-struct PicoDevices<Display, Touch> {
+enum PioTransfer<TO: WriteTarget, CH: SingleChannel> {
+    Idle(CH, &'static mut [super::TargetPixel], TO),
+    Running(hal::dma::SingleBuffering<CH, PartialReadBuffer, TO>),
+}
+
+impl<TO: WriteTarget<TransmittedWord = u8>, CH: SingleChannel> PioTransfer<TO, CH> {
+    fn wait(self) -> (CH, &'static mut [super::TargetPixel], TO) {
+        match self {
+            PioTransfer::Idle(a, b, c) => (a, b, c),
+            PioTransfer::Running(dma) => {
+                let (a, b, c) = dma.wait();
+                (a, b.0, c)
+            }
+        }
+    }
+}
+
+struct PicoDevices<Display, Touch, PioTransfer, Stolen> {
     display: Display,
     touch: Touch,
     last_touch: Option<i_slint_core::graphics::Point>,
     timer: Timer,
+    buffer: &'static mut [super::TargetPixel],
+    pio: Option<PioTransfer>,
+    stolen_pin: Stolen,
 }
 
-impl<Display: Devices, IRQ: InputPin, CS: OutputPin<Error = IRQ::Error>, SPI: Transfer<u8>> Devices
-    for PicoDevices<Display, xpt2046::XPT2046<IRQ, CS, SPI>>
+impl<
+        DI: display_interface::WriteOnlyDataCommand,
+        RST: OutputPin,
+        IRQ: InputPin,
+        CS: OutputPin<Error = IRQ::Error>,
+        SPI: Transfer<u8>,
+        TO: WriteTarget<TransmittedWord = u8> + Write<u8>,
+        CH: SingleChannel,
+        DC_: OutputPin,
+        CS_: OutputPin,
+    > Devices
+    for PicoDevices<
+        st7789::ST7789<DI, RST>,
+        xpt2046::XPT2046<IRQ, CS, SPI>,
+        PioTransfer<TO, CH>,
+        (DC_, CS_),
+    >
 {
     fn screen_size(&self) -> PhysicalSize {
-        self.display.screen_size()
+        let s = self.display.size();
+        euclid::size2(s.width as _, s.height as _)
     }
 
-    fn fill_region(&mut self, region: PhysicalRect, pixels: &[super::TargetPixel]) {
-        self.display.fill_region(region, pixels)
+    fn render_line(
+        &mut self,
+        line: PhysicalLength,
+        dirty_region: crate::renderer::DirtyRegion,
+        fill_buffer: &mut dyn FnMut(&mut [Rgb565]),
+    ) {
+        //let [b1, b2] = &mut self.buffers;
+        //let line_buffer = b1.take().or_else(|| b2.take()).unwrap();
+        fill_buffer(self.buffer);
+
+        let (ch, mut b, mut spi) = self.pio.take().unwrap().wait();
+        self.stolen_pin.1.set_high();
+
+        core::mem::swap(&mut self.buffer, &mut b);
+        // We send empty data
+        self.display.set_pixels(
+            dirty_region.min_x() as _,
+            line.get() as _,
+            dirty_region.max_x() as u16,
+            line.get() as u16,
+            core::iter::empty(),
+            //self.buffer[dirty_region.origin.x as usize
+            //    ..dirty_region.origin.x as usize + dirty_region.size.width as usize]
+            //    .iter()
+            //    .map(|x| embedded_graphics::pixelcolor::raw::RawU16::from(*x).into_inner()),
+        );
+
+        self.stolen_pin.1.set_low();
+        self.stolen_pin.0.set_high();
+
+        if false || (line.get() == 2) {
+            let mut dma = hal::dma::SingleBufferingConfig::new(
+                ch,
+                PartialReadBuffer(b, dirty_region.min_x() as _..dirty_region.max_x() as _),
+                spi,
+            );
+            dma.pace(hal::dma::Pace::PreferSink);
+            self.pio = Some(PioTransfer::Running(dma.start()));
+        } else {
+            for x in &b[dirty_region.min_x() as _..dirty_region.max_x() as _] {
+                let mut r =
+                    embedded_graphics::pixelcolor::raw::RawU16::from(*x).into_inner().to_be_bytes();
+                spi.write(&mut r);
+            }
+
+            self.pio = Some(PioTransfer::Idle(ch, b, spi))
+
+            //self.stolen_pin.1.set_high();
+        }
+    }
+
+    fn flush_frame(&mut self) {
+        let (ch, b, spi) = self.pio.take().unwrap().wait();
+        self.stolen_pin.1.set_high();
+        self.pio = Some(PioTransfer::Idle(ch, b, spi));
+
+        //self.display.set_pixels(3, 5, 6, 7, core::iter::repeat(0x14f8).take(4 * 3));
     }
 
     fn debug(&mut self, text: &str) {
-        self.display.debug(text)
+        i_slint_core::debug_log!("{text}");
     }
 
     fn read_touch_event(&mut self) -> Option<i_slint_core::input::MouseEvent> {
@@ -135,7 +259,7 @@ impl<Display: Devices, IRQ: InputPin, CS: OutputPin<Error = IRQ::Error>, SPI: Tr
             .map_err(|_| ())
             .unwrap()
             .map(|point| {
-                let size = self.display.screen_size().to_f32();
+                let size = self.screen_size().to_f32();
                 let pos = euclid::point2(point.x * size.width, point.y * size.height).cast();
                 match self.last_touch.replace(pos) {
                     Some(_) => i_slint_core::input::MouseEvent::MouseMoved { pos },
@@ -151,6 +275,16 @@ impl<Display: Devices, IRQ: InputPin, CS: OutputPin<Error = IRQ::Error>, SPI: Tr
 
     fn time(&self) -> core::time::Duration {
         core::time::Duration::from_micros(self.timer.get_counter())
+    }
+}
+
+struct PartialReadBuffer(&'static mut [Rgb565], core::ops::Range<usize>);
+unsafe impl embedded_dma::ReadBuffer for PartialReadBuffer {
+    type Word = u8;
+
+    unsafe fn read_buffer(&self) -> (*const <Self as embedded_dma::ReadBuffer>::Word, usize) {
+        let act_slice = &self.0[self.1.clone()];
+        (act_slice.as_ptr() as *const u8, act_slice.len() * core::mem::size_of::<Rgb565>())
     }
 }
 
@@ -325,7 +459,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     use embedded_graphics::{
         draw_target::DrawTarget,
         mono_font::{ascii::FONT_6X10, MonoTextStyle},
-        pixelcolor::Rgb565,
         prelude::*,
         text::Text,
     };
