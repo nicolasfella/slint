@@ -172,7 +172,7 @@ impl<
         IRQ: InputPin,
         CS: OutputPin<Error = IRQ::Error>,
         SPI: Transfer<u8>,
-        TO: WriteTarget<TransmittedWord = u8> + Write<u8>,
+        TO: WriteTarget<TransmittedWord = u8>, // + Write<u8>,
         CH: SingleChannel,
         DC_: OutputPin,
         CS_: OutputPin,
@@ -199,53 +199,57 @@ impl<
         //let line_buffer = b1.take().or_else(|| b2.take()).unwrap();
         fill_buffer(self.buffer);
 
+        for x in &mut self.buffer[dirty_region.min_x() as _..dirty_region.max_x() as _] {
+            *x = embedded_graphics::pixelcolor::raw::RawU16::from(x.into_storage().to_be()).into()
+        }
+
         let (ch, mut b, mut spi) = self.pio.take().unwrap().wait();
         self.stolen_pin.1.set_high();
 
+        /*self.display.set_pixels(
+            dirty_region.min_x() as _,
+            line.get() as _,
+            dirty_region.max_x() as u16,
+            line.get() as u16,
+            self.buffer[dirty_region.origin.x as usize
+                ..dirty_region.origin.x as usize + dirty_region.size.width as usize]
+                .iter()
+                .map(|x| embedded_graphics::pixelcolor::raw::RawU16::from(*x).into_inner()),
+        );*/
+
         core::mem::swap(&mut self.buffer, &mut b);
-        // We send empty data
+
+        // We send empty data just to get the device in the right window
         self.display.set_pixels(
             dirty_region.min_x() as _,
             line.get() as _,
             dirty_region.max_x() as u16,
             line.get() as u16,
             core::iter::empty(),
-            //self.buffer[dirty_region.origin.x as usize
-            //    ..dirty_region.origin.x as usize + dirty_region.size.width as usize]
-            //    .iter()
-            //    .map(|x| embedded_graphics::pixelcolor::raw::RawU16::from(*x).into_inner()),
         );
 
         self.stolen_pin.1.set_low();
         self.stolen_pin.0.set_high();
 
-        if false || (line.get() == 2) {
-            let mut dma = hal::dma::SingleBufferingConfig::new(
-                ch,
-                PartialReadBuffer(b, dirty_region.min_x() as _..dirty_region.max_x() as _),
-                spi,
-            );
-            dma.pace(hal::dma::Pace::PreferSink);
-            self.pio = Some(PioTransfer::Running(dma.start()));
-        } else {
-            for x in &b[dirty_region.min_x() as _..dirty_region.max_x() as _] {
-                let mut r =
-                    embedded_graphics::pixelcolor::raw::RawU16::from(*x).into_inner().to_be_bytes();
-                spi.write(&mut r);
-            }
-
-            self.pio = Some(PioTransfer::Idle(ch, b, spi))
-
-            //self.stolen_pin.1.set_high();
-        }
+        let mut dma = hal::dma::SingleBufferingConfig::new(
+            ch,
+            PartialReadBuffer(b, dirty_region.min_x() as _..dirty_region.max_x() as _),
+            spi,
+        );
+        dma.pace(hal::dma::Pace::PreferSink);
+        self.pio = Some(PioTransfer::Running(dma.start()));
+        //let (a, b, c) = dma.start().wait();
+        //self.pio = Some(PioTransfer::Idle(a, b.0, c));
+        //self.pio = Some(PioTransfer::Idle(ch, b, spi))
     }
 
     fn flush_frame(&mut self) {
         let (ch, b, spi) = self.pio.take().unwrap().wait();
         self.stolen_pin.1.set_high();
+        ch.ch().ch_al1_ctrl.write(|w| w.en().bit(false));
+        //ch.ch().ch_al2_write_addr_trig.write(|w| unsafe { w.bits(0) });
+        ch.ch().ch_write_addr.write(|w| unsafe { w.bits(0) });
         self.pio = Some(PioTransfer::Idle(ch, b, spi));
-
-        //self.display.set_pixels(3, 5, 6, 7, core::iter::repeat(0x14f8).take(4 * 3));
     }
 
     fn debug(&mut self, text: &str) {
